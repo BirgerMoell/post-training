@@ -2,7 +2,7 @@
 
 import pytest
 
-from post_training.config import PostTrainingConfig
+from post_training.config import DatasetEntry, PostTrainingConfig
 from post_training.utils import prefetch
 
 
@@ -78,3 +78,34 @@ def test_local_tokenizer_path_is_not_downloaded(downloads, tmp_path):
 
     assert downloads == [("org/model", None, None)]
     assert paths.tokenizer == str(tmp_path)
+
+
+def test_dataset_prefetch_uses_revision_and_selected_location(monkeypatch):
+    calls = []
+
+    class FakeDataset:
+        cache_files = [{"filename": "/cache/datasets/dolci.arrow"}]
+
+    monkeypatch.setattr(
+        prefetch,
+        "load_dataset",
+        lambda path, **kwargs: calls.append((path, kwargs)) or FakeDataset(),
+    )
+    entry = DatasetEntry(
+        name="dolci",
+        path="org/dolci",
+        revision="abc123",
+        subset="fi",
+        split="train",
+        locations={"lumi": "org/lumi-dolci"},
+    )
+
+    cache_files = prefetch._prefetch_dataset(entry, "lumi")
+
+    assert calls == [
+        (
+            "org/lumi-dolci",
+            {"split": "train", "name": "fi", "revision": "abc123"},
+        )
+    ]
+    assert cache_files == ["/cache/datasets/dolci.arrow"]

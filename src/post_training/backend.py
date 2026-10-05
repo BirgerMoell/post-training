@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 from abc import ABC, abstractmethod
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -71,11 +72,8 @@ def _shorten_dataset_name(name: str) -> str:
 
 
 def _dataset_mix_hash(datasets: list) -> str:
-    canonical = sorted(
-        [{"name": d.name, "path": d.path, "weight": d.weight} for d in datasets],
-        key=lambda x: x["name"],
-    )
-    return hashlib.sha256(json.dumps(canonical).encode()).hexdigest()[:8]
+    canonical = sorted([asdict(dataset) for dataset in datasets], key=lambda item: item["name"])
+    return hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()[:8]
 
 
 class TRLBackend(Backend):
@@ -102,16 +100,20 @@ class TRLBackend(Backend):
             if not config.container.env_file:
                 raise ValueError("container.env_file must be set when container.image is set.")
 
-        total_weight = 0.0
-        for entry in config.data.datasets:
-            if entry.weight < 0:
-                raise ValueError(
-                    f"data.datasets[].weight must be non-negative, got {entry.weight} "
-                    f"for dataset '{entry.name}'."
-                )
-            total_weight += entry.weight
-        if config.data.datasets and total_weight <= 0:
-            raise ValueError("Sum of data.datasets[].weight must be > 0.")
+        for field_name, entries in (
+            ("data.datasets", config.data.datasets),
+            ("data.eval_datasets", config.data.eval_datasets),
+        ):
+            total_weight = 0.0
+            for entry in entries:
+                if entry.weight < 0:
+                    raise ValueError(
+                        f"{field_name}[].weight must be non-negative, got {entry.weight} "
+                        f"for dataset '{entry.name}'."
+                    )
+                total_weight += entry.weight
+            if entries and total_weight <= 0:
+                raise ValueError(f"Sum of {field_name}[].weight must be > 0.")
 
         t = config.training
 
@@ -119,6 +121,21 @@ class TRLBackend(Backend):
             raise ValueError("training.effective_batch_size must be positive.")
         if t.per_device_train_batch_size <= 0:
             raise ValueError("training.per_device_train_batch_size must be positive.")
+        if config.evaluation.per_device_batch_size <= 0:
+            raise ValueError("evaluation.per_device_batch_size must be positive.")
+
+        if config.method == "dpo":
+            if config.dpo.max_seq_length <= 0:
+                raise ValueError("dpo.max_seq_length must be positive.")
+            if config.dpo.truncated_pair_action not in {"warn", "drop"}:
+                raise ValueError(
+                    "dpo.truncated_pair_action must be either 'warn' or 'drop'."
+                )
+            if (
+                config.dpo.precompute_ref_batch_size is not None
+                and config.dpo.precompute_ref_batch_size <= 0
+            ):
+                raise ValueError("dpo.precompute_ref_batch_size must be positive when set.")
 
         # Training length: exactly one of max_steps / num_train_epochs /
         # num_training_samples / num_training_tokens must be specified.
@@ -199,6 +216,10 @@ class TRLBackend(Backend):
         so an interrupted previous attempt can never leave a partial freeze that
         gets mistaken for a completed one.
         """
+        from post_training.data.mix import write_mix_lock
+
+        write_mix_lock(config, run_dir)
+
         if config.container is None or not config.container.image:
             return
 
@@ -246,6 +267,75 @@ class LlamaFactoryBackend(Backend):
         return render_llamafactory_slurm_script(config, run_dir)
 
     def post_freeze(self, config, run_dir):
+        from post_training.data.mix import write_mix_lock
+
+        write_mix_lock(config, run_dir)
+
+        if config.data.mix_id:
+            registry: dict[str, dict] = {}
+            names: list[str] = []
+            dataset_dir = run_dir / "llamafactory_data"
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+            for entry in config.data.datasets:
+                if entry.weight != 1.0:
+                    raise ValueError(
+                        "LlamaFactory mix manifests currently require weight=1.0. "
+                        "Use LlamaFactory-native interleave settings for weighted mixes."
+                    )
+                metadata = dict(entry.llamafactory or {})
+                resolved_path = entry.resolve_path(config.data.location)
+                if entry.prefetched_files:
+                    release_dir = dataset_dir / "releases" / entry.name
+                    release_dir.mkdir(parents=True, exist_ok=True)
+                    for index, source in enumerate(entry.prefetched_files):
+                        source_path = Path(source).resolve()
+                        if not source_path.is_file():
+                            raise ValueError(
+                                f"Prefetched file for dataset '{entry.name}' no longer exists: "
+                                f"{source_path}"
+                            )
+                        link = release_dir / f"part-{index:05d}{source_path.suffix}"
+                        if not link.exists():
+                            link.symlink_to(source_path)
+                    # A file entry takes precedence over a Hub entry in the
+                    # generated registry and makes the selected revision exact.
+                    metadata.pop("hf_hub_url", None)
+                    metadata["file_name"] = str(release_dir.relative_to(dataset_dir))
+                elif "file_name" not in metadata and "hf_hub_url" not in metadata:
+                    if Path(resolved_path).exists() or resolved_path.startswith("/"):
+                        metadata["file_name"] = resolved_path
+                    else:
+                        if entry.revision is not None:
+                            raise ValueError(
+                                f"LlamaFactory cannot pass revision={entry.revision!r} for Hub "
+                                f"dataset '{entry.name}' through dataset_info.json. Keep "
+                                "prefetch_assets=true or select a cluster-local release so the "
+                                "pinned artifact is materialized before submission."
+                            )
+                        metadata["hf_hub_url"] = resolved_path
+                elif entry.revision is not None and "hf_hub_url" in metadata:
+                    raise ValueError(
+                        f"LlamaFactory dataset_info.json has no revision field, so explicit "
+                        f"hf_hub_url for pinned dataset '{entry.name}' is unsafe. Keep "
+                        "prefetch_assets=true or use file_name for an immutable local release."
+                    )
+                if "hf_hub_url" in metadata:
+                    if entry.subset is not None:
+                        metadata.setdefault("subset", entry.subset)
+                    if entry.data_dir is not None:
+                        metadata.setdefault("folder", entry.data_dir)
+                    metadata.setdefault("split", entry.split)
+                registry[entry.name] = metadata
+                names.append(entry.name)
+
+            (dataset_dir / "dataset_info.json").write_text(
+                json.dumps(registry, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            config.llamafactory = dict(config.llamafactory or {})
+            config.llamafactory["dataset_dir"] = str(dataset_dir.resolve())
+            config.llamafactory["dataset"] = ",".join(names)
+
         lf_config_path = run_dir / "llamafactory_config.yaml"
         with open(lf_config_path, "w") as f:
             yaml.dump(config.llamafactory, f, default_flow_style=False)

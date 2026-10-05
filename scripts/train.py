@@ -196,6 +196,19 @@ def main() -> None:
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
 
+    if config.checkpointing.save_final_model:
+        final_model_dir = run_dir / "final_model"
+        logger.info("Saving final model to %s.", final_model_dir)
+        trainer.save_model(str(final_model_dir))
+        if trainer.is_world_process_zero():
+            trainer.processing_class.save_pretrained(final_model_dir)
+
+    if config.evaluation.final_eval and getattr(trainer, "eval_dataset", None) is not None:
+        logger.info("Running final evaluation.")
+        eval_metrics = trainer.evaluate()
+        trainer.log_metrics("eval", eval_metrics)
+        trainer.save_metrics("eval", eval_metrics)
+
 
 if __name__ == "__main__":
     main()

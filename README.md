@@ -90,6 +90,8 @@ accelerate launch \
     offline=true
 ```
 
+For the LUMI 9B three-source DPO run, see the [full training configuration](configs/trl/oellm-9b-threeway-dpo-full-lumi.yaml), [data-staging script](scripts/stage_threeway_dpo_full.py), [SLURM jobs](slurm/oellm_threeway_dpo_full_lumi.sbatch), and [run/data documentation](docs/model-card-threeway-dpo-step9000.md). The staged mix uses HelpSteer3, Dolci translated DPO, and cleaned UltraFeedback. It is a natural-size mixture, not equal sampling by source; the documentation records source and language counts, filtering, hyperparameters, and reproducibility caveats. The dataset files and model weights are intentionally not stored in Git.
+
 > [!NOTE]
 > The `--mixed_precision` flag passed to `accelerate launch` must match `model.dtype` in your config.
 
@@ -308,6 +310,24 @@ data:
       split: "train"
       weight: 1.0  # 1 = full dataset, <1 undersamples, >1 oversamples
 ```
+
+For reusable, reviewed recipes, point the same config at an external mix from
+[`OpenEuroLLM/post-training-data`](https://github.com/OpenEuroLLM/post-training-data):
+
+```yaml
+data:
+  mix_manifest: /path/to/post-training-data/mixes/pilots/sft-instruct-smoke-v1.yaml
+  location: lumi  # null uses the portable/Hugging Face release
+```
+
+Collection-backed entries resolve a named `release` from each dataset's
+`metadata.yaml` into the existing `data.datasets` structure. This keeps the
+runtime compatible with direct entries while preserving source, PII,
+contamination, quality, and release provenance. Hugging Face revisions are
+pinned; local `.jsonl.zst` releases and cluster-specific mirrors are supported.
+The frozen run config is self-contained, and `data-mix.lock.yaml` records both
+the mix and collection-metadata digests. See
+[`docs/data-collection.md`](docs/data-collection.md) for the full contract.
 
 #### B. Data transformations
 

@@ -1,9 +1,13 @@
 """Tests for TRLBackend.post_freeze() — the submission-time source freeze."""
 
+import json
 import logging
 
-from post_training.backend import TRLBackend
-from post_training.config import ContainerConfig, PostTrainingConfig
+import pytest
+import yaml
+
+from post_training.backend import LlamaFactoryBackend, TRLBackend
+from post_training.config import ContainerConfig, DatasetEntry, PostTrainingConfig
 
 
 def _make_fake_repo(repo_dir, marker: str = "live") -> None:
@@ -123,3 +127,101 @@ def test_post_freeze_recovers_from_interrupted_copy(tmp_path, monkeypatch):
     assert (frozen_src / "marker.txt").read_text() == "live"
     assert not (frozen_src / "half-written.py").exists()
     assert not tmp_src.exists()
+
+
+def test_trl_post_freeze_writes_resolved_mix_lock(tmp_path):
+    cfg = PostTrainingConfig()
+    cfg.container = None
+    cfg.data.mix_id = "flag-sft-v1"
+    cfg.data.mix_digest = "a" * 64
+    cfg.data.mix_manifest = "/catalogue/mix.yaml"
+    cfg.data.location = "lumi"
+    cfg.data.datasets = [
+        DatasetEntry(
+            name="dolci",
+            path="org/dolci",
+            revision="abc123",
+            locations={"lumi": "/scratch/dolci"},
+        )
+    ]
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    TRLBackend().post_freeze(cfg, run_dir)
+
+    lock = yaml.safe_load((run_dir / "data-mix.lock.yaml").read_text())
+    assert lock["mix_id"] == "flag-sft-v1"
+    assert lock["datasets"][0]["resolved_path"] == "/scratch/dolci"
+    assert lock["datasets"][0]["revision"] == "abc123"
+
+
+def test_llamafactory_post_freeze_generates_registry_from_mix(tmp_path):
+    cfg = PostTrainingConfig()
+    cfg.backend = "llamafactory"
+    cfg.llamafactory = {"stage": "sft", "dataset": "placeholder"}
+    cfg.data.mix_id = "long-context-sft-v1"
+    cfg.data.mix_digest = "b" * 64
+    cfg.data.location = "lumi"
+    cfg.data.datasets = [
+        DatasetEntry(
+            name="long_sft",
+            path="org/long-sft",
+            revision="def456",
+            locations={"lumi": "/scratch/long-sft.jsonl"},
+            llamafactory={
+                "formatting": "sharegpt",
+                "columns": {"messages": "messages"},
+            },
+        )
+    ]
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    LlamaFactoryBackend().post_freeze(cfg, run_dir)
+
+    registry = json.loads((run_dir / "llamafactory_data" / "dataset_info.json").read_text())
+    assert registry["long_sft"]["file_name"] == "/scratch/long-sft.jsonl"
+    lf_config = yaml.safe_load((run_dir / "llamafactory_config.yaml").read_text())
+    assert lf_config["dataset"] == "long_sft"
+    assert lf_config["dataset_dir"] == str((run_dir / "llamafactory_data").resolve())
+
+
+def test_llamafactory_uses_prefetched_revision_files(tmp_path):
+    cached = tmp_path / "cache" / "pinned.arrow"
+    cached.parent.mkdir()
+    cached.write_bytes(b"arrow")
+    cfg = PostTrainingConfig()
+    cfg.backend = "llamafactory"
+    cfg.llamafactory = {"stage": "sft"}
+    cfg.data.mix_id = "pinned-lf-v1"
+    cfg.data.datasets = [
+        DatasetEntry(
+            name="long_sft",
+            path="org/long-sft",
+            revision="commit123",
+            prefetched_files=[str(cached)],
+            llamafactory={"formatting": "sharegpt"},
+        )
+    ]
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    LlamaFactoryBackend().post_freeze(cfg, run_dir)
+
+    registry = json.loads((run_dir / "llamafactory_data" / "dataset_info.json").read_text())
+    assert registry["long_sft"]["file_name"] == "releases/long_sft"
+    link = run_dir / "llamafactory_data" / "releases" / "long_sft" / "part-00000.arrow"
+    assert link.resolve() == cached.resolve()
+
+
+def test_llamafactory_rejects_unmaterialized_pinned_hub_dataset(tmp_path):
+    cfg = PostTrainingConfig()
+    cfg.backend = "llamafactory"
+    cfg.llamafactory = {"stage": "sft"}
+    cfg.data.mix_id = "pinned-lf-v1"
+    cfg.data.datasets = [DatasetEntry(name="long_sft", path="org/long-sft", revision="commit123")]
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    with pytest.raises(ValueError, match="prefetch_assets=true"):
+        LlamaFactoryBackend().post_freeze(cfg, run_dir)

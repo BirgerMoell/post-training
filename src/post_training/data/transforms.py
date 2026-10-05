@@ -483,6 +483,37 @@ def helpsteer3_preference(example: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@register_transform("helpsteer3_dpo")
+def helpsteer3_dpo(example: dict[str, Any]) -> dict[str, Any]:
+    """Transform the HelpSteer3 Preference split into an explicit DPO pair.
+
+    ``overall_preference`` is signed from response 1's perspective: negative
+    values prefer response 1 and positive values prefer response 2.  Ties are
+    represented by empty completions so the DPO row filter drops them rather
+    than inventing an ordering.  The absolute score is retained for analysis;
+    vanilla DPO intentionally uses only the sign.
+    """
+    preference = int(example["overall_preference"])
+    if preference == 0:
+        chosen: list[dict[str, str]] = []
+        rejected: list[dict[str, str]] = []
+    else:
+        chosen_response, rejected_response = (
+            (example["response2"], example["response1"])
+            if preference > 0
+            else (example["response1"], example["response2"])
+        )
+        chosen = [{"role": "assistant", "content": chosen_response}]
+        rejected = [{"role": "assistant", "content": rejected_response}]
+
+    return {
+        "prompt": example["context"],
+        "chosen": chosen,
+        "rejected": rejected,
+        "preference_strength": abs(preference),
+    }
+
+
 @register_transform("helpsteer3_feedback")
 def helpsteer3_feedback(example: dict[str, Any]) -> dict[str, Any]:
     """Transform nvidia/HelpSteer3 Feedback split for SFT.

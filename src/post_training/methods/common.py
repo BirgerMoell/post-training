@@ -45,7 +45,15 @@ def build_tokenizer(config: PostTrainingConfig) -> AutoTokenizer:
     tokenizer_name_or_path, revision = config.model.resolve_tokenizer()
     logger.info("Loading tokenizer '%s' (revision=%s)", tokenizer_name_or_path, revision or "main")
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, revision=revision)
+    # Prefer the Rust fast tokenizer.  Some staged Llama checkpoints contain
+    # ``tokenizer.json`` but intentionally omit the legacy SentencePiece
+    # ``tokenizer.model`` file; letting AutoTokenizer select the slow class
+    # from tokenizer_config.json then fails with ``TypeError: not a string``.
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name_or_path,
+        revision=revision,
+        use_fast=True,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -181,6 +189,12 @@ def build_common_training_kwargs(
         duration_kwargs = {"max_steps": max_steps}
         logger.info("Training duration: %d steps", max_steps)
 
+    warmup_kwargs: dict[str, Any]
+    if 0 < t.warmup_steps < 1:
+        warmup_kwargs = {"warmup_ratio": t.warmup_steps, "warmup_steps": 0}
+    else:
+        warmup_kwargs = {"warmup_steps": int(t.warmup_steps)}
+
     return dict(
         output_dir=str(run_dir / "checkpoints"),
         **duration_kwargs,
@@ -191,7 +205,7 @@ def build_common_training_kwargs(
         weight_decay=t.weight_decay,
         adam_epsilon=t.adam_epsilon,
         gradient_accumulation_steps=grad_accum,
-        warmup_steps=t.warmup_steps,
+        **warmup_kwargs,
         lr_scheduler_type=t.lr_scheduler_type,
         lr_scheduler_kwargs=(
             None
@@ -220,6 +234,12 @@ def build_common_training_kwargs(
         save_strategy=config.checkpointing.save_strategy,
         save_steps=config.checkpointing.save_steps,
         save_total_limit=config.checkpointing.save_total_limit,
+        save_only_model=config.checkpointing.save_only_model,
+        # Evaluation
+        eval_strategy=config.evaluation.strategy,
+        eval_steps=config.evaluation.steps,
+        per_device_eval_batch_size=config.evaluation.per_device_batch_size,
+        eval_on_start=config.evaluation.on_start,
         # Logging
         report_to=config.logging.report_to,
         logging_steps=config.logging.logging_steps,

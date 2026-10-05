@@ -296,3 +296,119 @@ def test_features_with_transform_remove_original_columns(monkeypatch):
 
     assert mixed.column_names == ["messages"]
     assert mixed.features == features
+
+
+def test_hub_revision_and_cluster_location_are_forwarded(monkeypatch):
+    calls = []
+
+    def fake_load_dataset(path: str, **kwargs) -> Dataset:
+        calls.append((path, kwargs))
+        return _dataset("a", 2)
+
+    monkeypatch.setattr(loader, "load_dataset", fake_load_dataset)
+    config = DataConfig(
+        num_proc=1,
+        location="lumi",
+        datasets=[
+            DatasetEntry(
+                name="a",
+                path="org/dataset",
+                revision="abc123",
+                locations={"lumi": "org/lumi-mirror"},
+                expected_rows=2,
+            )
+        ],
+    )
+
+    loader.load_and_mix_datasets(config)
+
+    assert calls == [("org/lumi-mirror", {"split": "train", "revision": "abc123"})]
+
+
+def test_expected_row_count_is_checked_before_sampling(monkeypatch):
+    _patch_load_dataset(monkeypatch, {"dataset-a": _dataset("a", 2)})
+    config = _config(
+        DatasetEntry(name="a", path="dataset-a", expected_rows=3),
+    )
+
+    with pytest.raises(ValueError, match="expected 3"):
+        loader.load_and_mix_datasets(config)
+
+
+def test_compressed_jsonl_file_uses_json_builder(monkeypatch, tmp_path):
+    path = tmp_path / "data.jsonl.zst"
+    path.write_bytes(b"placeholder")
+    calls = []
+
+    def fake_load_dataset(builder: str, **kwargs) -> Dataset:
+        calls.append((builder, kwargs))
+        return _dataset("a", 1)
+
+    monkeypatch.setattr(loader, "load_dataset", fake_load_dataset)
+    loader._load_dataset_entry(str(path), "train", revision="ignored-for-local")
+
+    assert calls == [
+        ("json", {"data_files": {"train": str(path)}, "split": "train"}),
+    ]
+
+
+def test_mixing_aligns_optional_nested_message_fields(monkeypatch):
+    basic_features = Features(
+        {
+            "messages": List(
+                {
+                    "content": Value("string"),
+                    "role": Value("string"),
+                }
+            )
+        }
+    )
+    tool_features = Features(
+        {
+            "messages": List(
+                {
+                    "content": Value("string"),
+                    "function_calls": Value("string"),
+                    "functions": Value("string"),
+                    "role": Value("string"),
+                }
+            )
+        }
+    )
+    basic = Dataset.from_list(
+        [{"messages": [{"role": "user", "content": "hello"}]}],
+        features=basic_features,
+    )
+    tool = Dataset.from_list(
+        [
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "functions": None,
+                        "function_calls": 'lookup(query="x")',
+                    }
+                ]
+            }
+        ],
+        features=tool_features,
+    )
+    _patch_load_dataset(monkeypatch, {"basic": basic, "tool": tool})
+
+    mixed = loader.load_and_mix_datasets(
+        _config(
+            DatasetEntry(name="basic", path="basic"),
+            DatasetEntry(name="tool", path="tool"),
+        )
+    )
+
+    assert set(mixed.features["messages"].feature) == {
+        "content",
+        "function_calls",
+        "functions",
+        "role",
+    }
+    basic_row = next(row for row in mixed if row["messages"][0]["content"] == "hello")
+    assert basic_row["messages"][0]["functions"] is None
+    assert basic_row["messages"][0]["function_calls"] is None

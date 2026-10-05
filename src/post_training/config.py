@@ -157,6 +157,22 @@ class DPOMethodConfig:
     ref_model_name_or_path: str | None = None
     max_seq_length: int = 2048
     dataset_num_proc: int | None = None
+    precompute_ref_log_probs: bool = False
+    precompute_ref_batch_size: int | None = None
+    # DPO otherwise truncates prompt/completion pairs at max_seq_length.  Use
+    # "drop" when a run must train only on complete preference judgements.
+    truncated_pair_action: str = "warn"
+
+
+@dataclass
+class EvaluationConfig:
+    """Evaluation scheduling shared by training methods."""
+
+    strategy: str = "no"
+    steps: float | None = None
+    per_device_batch_size: int = 1
+    on_start: bool = False
+    final_eval: bool = True
 
 
 @dataclass
@@ -166,10 +182,12 @@ class CheckpointingConfig:
     save_strategy: str = "steps"
     save_steps: int = 500
     save_total_limit: int = 2
+    save_only_model: bool = False
     # When set to ``None`` (or a non-positive value via CLI overrides), inference
     # checkpoints are disabled and no `inference_checkpoints/` directory is created.
     inference_checkpoint_steps: int | None = 200
     inference_checkpoint_path: str = "inference_checkpoints"
+    save_final_model: bool = True
 
 
 @dataclass
@@ -178,11 +196,32 @@ class DatasetEntry:
 
     name: str = MISSING
     path: str = MISSING
+    revision: str | None = None
     data_dir: str | None = None
     subset: str | None = None
     split: str = "train"
     weight: float = 1.0
     transform: str | None = None
+    catalogue_entry: str | None = None
+    collection_metadata: str | None = None
+    collection_digest: str | None = None
+    release: str | None = None
+    release_status: str | None = None
+    checks: dict[str, Any] = field(default_factory=dict)
+    schema: str | None = None
+    expected_rows: int | None = None
+    sha256: str | None = None
+    locations: dict[str, str] = field(default_factory=dict)
+    # Filled by login-node prefetching. LlamaFactory consumes symlinks to these
+    # revision-specific Arrow files instead of reloading an unpinned Hub main.
+    prefetched_files: list[str] = field(default_factory=list)
+    llamafactory: dict[str, Any] | None = None
+
+    def resolve_path(self, location: str | None = None) -> str:
+        """Resolve a portable dataset identity to a cluster-local path."""
+        if location is None:
+            return self.path
+        return self.locations.get(location, self.path)
 
 
 @dataclass
@@ -193,6 +232,15 @@ class DataConfig:
     num_proc: int | None = None  # None = auto (capped at 32)
     seed: int = 42  # Deterministic seed used for dataset resampling and shuffling.
     datasets: list[DatasetEntry] = field(default_factory=list)
+    eval_datasets: list[DatasetEntry] = field(default_factory=list)
+    # Optional reusable manifest. On first load it is expanded into datasets;
+    # frozen run configs retain both the expanded entries and the digest.
+    mix_manifest: str | None = None
+    mix_id: str | None = None
+    mix_digest: str | None = None
+    # Selects an entry from DatasetEntry.locations, e.g. "lumi". Falls back to
+    # the portable path (normally a Hugging Face dataset id).
+    location: str | None = None
 
 
 @dataclass
@@ -286,6 +334,7 @@ class PostTrainingConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     checkpointing: CheckpointingConfig = field(default_factory=CheckpointingConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
 
     # Method-specific (only the active method's block is used at runtime).
     sft: SFTMethodConfig = field(default_factory=SFTMethodConfig)
@@ -328,9 +377,13 @@ class PostTrainingConfig:
         schema = OmegaConf.structured(cls)
         file_cfg = OmegaConf.load(yaml_path)
 
-        # Migrate deprecated training.warmup_ratio -> training.warmup_steps
         file_dict = OmegaConf.to_container(file_cfg, resolve=False)
         if isinstance(file_dict, dict):
+            from post_training.data.mix import expand_mix_manifest
+
+            file_dict = expand_mix_manifest(file_dict, Path(yaml_path).resolve())
+
+            # Migrate deprecated training.warmup_ratio -> training.warmup_steps
             training_dict = file_dict.get("training", {})
             if isinstance(training_dict, dict) and "warmup_ratio" in training_dict:
                 logger.warning(
@@ -338,7 +391,7 @@ class PostTrainingConfig:
                     "(values < 1 are interpreted as a ratio). Auto-migrating."
                 )
                 training_dict.setdefault("warmup_steps", training_dict.pop("warmup_ratio"))
-                file_cfg = OmegaConf.create(file_dict)
+            file_cfg = OmegaConf.create(file_dict)
 
         merged: DictConfig = OmegaConf.merge(schema, file_cfg)
 

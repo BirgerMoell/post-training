@@ -1,0 +1,146 @@
+# Full-parameter DPO of the OpenEuroLLM 9B instruct SFT checkpoint on the
+# HelpSteer3 Preference split. Assets are staged to immutable LUMI-local paths
+# before submission; the source revisions are recorded below.
+method: dpo
+backend: trl
+run_name: oellm-9b-helpsteer3-dpo-v3
+offline: true
+prefetch_assets: false
+container: null
+
+model:
+  # Source: Neonkraft/oellm-9b-256k-theta64m-prelude-anneal300b-instruct-sft
+  # Commit: 85bf18fb4f0bee6ac6270f06b1d1c6b3be200f31
+  name_or_path: /scratch/project_465002530/users/bmoell/helpsteer3-dpo/artifacts/model
+  attn_implementation: flash_attention_2
+  dtype: bfloat16
+  revision: null
+  tokenizer_name_or_path: null
+  tokenizer_revision: null
+
+training:
+  max_steps: null
+  num_train_epochs: 1.0
+  num_training_samples: null
+  num_training_tokens: null
+  learning_rate: 5.0e-7
+  effective_batch_size: 32
+  per_device_train_batch_size: 1
+  warmup_steps: 0.03
+  lr_scheduler_type: cosine
+  lr_scheduler_kwargs: null
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  weight_decay: 0.0
+  adam_epsilon: 1.0e-8
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+    determinism_check: default
+    debug: false
+    # Complete every non-reentrant checkpoint recomputation on every rank.
+    # Early stopping produced rank-dependent FSDP collective ordering when
+    # preference examples had different sequence lengths.
+    early_stop: false
+  bf16: true
+  seed: 42
+  use_liger_kernel: false
+  liger_kernel_config: null
+
+dpo:
+  beta: 0.1
+  loss_type: sigmoid
+  ref_model_name_or_path: null
+  max_seq_length: 8192
+  dataset_num_proc: 8
+  # TRL precomputation runs while FSDP's CPU-efficient model is still on CPU,
+  # but its prepared dataloader has already moved inputs to each GPU. Compute
+  # reference scores online so model and inputs share the prepared device.
+  precompute_ref_log_probs: false
+  precompute_ref_batch_size: 1
+  truncated_pair_action: drop
+
+evaluation:
+  strategy: "no"
+  steps: null
+  per_device_batch_size: 1
+  on_start: false
+  final_eval: true
+
+checkpointing:
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 1
+  save_only_model: true
+  inference_checkpoint_steps: null
+  inference_checkpoint_path: inference_checkpoints
+  save_final_model: true
+
+data:
+  # Source: nvidia/HelpSteer3, subset preference
+  # Commit: f6d145777bcbde96137596340fab89793acd1031
+  chat_template: qwen3
+  num_proc: 8
+  seed: 42
+  location: lumi
+  datasets:
+    - name: helpsteer3-preference-train
+      path: nvidia/HelpSteer3
+      revision: f6d145777bcbde96137596340fab89793acd1031
+      subset: preference
+      split: train
+      weight: 1.0
+      transform: helpsteer3_dpo
+      expected_rows: 38459
+      sha256: 32b52e1d378f8dab1e4c9ae549da49a5d6fc0875aeafe3f9139e6053beb906bb
+      locations:
+        lumi: /scratch/project_465002530/users/bmoell/helpsteer3-dpo/artifacts/data/preference-train.jsonl.gz
+  eval_datasets:
+    - name: helpsteer3-preference-validation
+      path: nvidia/HelpSteer3
+      revision: f6d145777bcbde96137596340fab89793acd1031
+      subset: preference
+      split: validation
+      weight: 1.0
+      transform: helpsteer3_dpo
+      expected_rows: 2017
+      sha256: cd0d8b6efd7869a44c1b5ff91701232062555829b3c838abfd770d7dab6c7861
+      locations:
+        lumi: /scratch/project_465002530/users/bmoell/helpsteer3-dpo/artifacts/data/preference-validation.jsonl.gz
+
+deepspeed: null
+
+accelerate:
+  mixed_precision: bf16
+  use_deepspeed: false
+  deepspeed_multinode_launcher: standard
+  same_network: true
+  rdzv_backend: static
+  dynamo_backend: "no"
+
+logging:
+  report_to:
+    - tensorboard
+  wandb_project: oellm-helpsteer3-dpo
+  logging_steps: 1
+  include_num_input_tokens_seen: "no"
+
+slurm:
+  partition: small-g
+  account: project_465002530
+  num_nodes: 4
+  gpus_per_node: 8
+  cpus_per_task: 56
+  mem: 480G
+  wall_time: 1-00:00:00
+  job_name: oellm-hs3-dpo
+  signal_time_seconds: 300
+  max_failures: 1
+
+debug:
+  enabled: false
+  override_existing: false
+
+paths:
+  output_base: /scratch/project_465002530/users/bmoell/helpsteer3-dpo/outputs
+  debug_base: /scratch/project_465002530/users/bmoell/helpsteer3-dpo/debug

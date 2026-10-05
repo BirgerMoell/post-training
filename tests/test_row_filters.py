@@ -604,6 +604,15 @@ def test_dpo_drops_a_pair_with_an_empty_rejected_side() -> None:
     assert kept["rejected"] == [_exchange(2)]
 
 
+def test_dpo_drops_a_pair_with_an_empty_response_text() -> None:
+    empty_response = [{"role": "assistant", "content": "  "}]
+    ds = _dpo_dataset([(empty_response, _exchange(0)), (_exchange(1), _exchange(2))])
+
+    kept = _filter_dpo_rows(ds, num_proc=1)
+
+    assert kept["chosen"] == [_exchange(1)]
+
+
 def test_dpo_reads_chosen_and_rejected_rather_than_messages() -> None:
     """Regression guard.  A DPO dataset carries `chosen` / `rejected` and no
     `messages` column (see `configs/trl/dpo.yaml`, which uses `transform: null`
@@ -614,3 +623,44 @@ def test_dpo_reads_chosen_and_rejected_rather_than_messages() -> None:
     assert "messages" not in ds.column_names
 
     assert len(_filter_dpo_rows(ds, num_proc=1)) == 1
+
+
+class _LengthTokenizer:
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt):
+        del tokenize, add_generation_prompt
+        return {
+            "input_ids": list(
+                range(sum(len(message["content"].split()) for message in messages))
+            )
+        }
+
+    def __call__(self, text, *, add_special_tokens):
+        del add_special_tokens
+        return {"input_ids": text.split()}
+
+
+def test_dpo_can_drop_pairs_that_would_be_truncated() -> None:
+    ds = Dataset.from_dict(
+        {
+            "prompt": [[{"role": "user", "content": "one two"}]] * 2,
+            "chosen": [
+                [{"role": "assistant", "content": "three four"}],
+                [{"role": "assistant", "content": "three four five"}],
+            ],
+            "rejected": [
+                [{"role": "assistant", "content": "three"}],
+                [{"role": "assistant", "content": "three"}],
+            ],
+        }
+    )
+
+    kept = _filter_dpo_rows(
+        ds,
+        num_proc=1,
+        tokenizer=_LengthTokenizer(),
+        max_length=4,
+        truncated_pair_action="drop",
+    )
+
+    assert len(kept) == 1
+    assert kept[0]["chosen"][0]["content"] == "three four"

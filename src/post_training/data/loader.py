@@ -14,7 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from datasets import Dataset, Features, concatenate_datasets, load_dataset
+from datasets import Dataset, Features, List, Value, concatenate_datasets, load_dataset
 
 from post_training.data.transforms import get_transform
 
@@ -23,7 +23,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MAX_NUM_PROC = len(os.sched_getaffinity(0))
+_MAX_NUM_PROC = min(
+    32,
+    len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1),
+)
 
 _EXTENSION_TO_BUILDER = {
     ".parquet": "parquet",
@@ -34,7 +37,24 @@ _EXTENSION_TO_BUILDER = {
 }
 
 
-def _load_dataset_entry(path: str, split: str, **load_kwargs) -> Dataset:
+def _builder_for_local_file(path: Path) -> str | None:
+    """Return the datasets builder for plain or compressed local files."""
+    name = path.name.lower()
+    for suffix, builder in _EXTENSION_TO_BUILDER.items():
+        if name.endswith(suffix) or any(
+            name.endswith(suffix + compression) for compression in (".zst", ".zstd", ".gz")
+        ):
+            return builder
+    return None
+
+
+def _load_dataset_entry(
+    path: str,
+    split: str,
+    *,
+    revision: str | None = None,
+    **load_kwargs,
+) -> Dataset:
     """Load *path* as a local data file, a local dataset directory, or a Hub repo id.
 
     ``load_dataset(path, ...)`` auto-detects a local file from the bare
@@ -47,14 +67,114 @@ def _load_dataset_entry(path: str, split: str, **load_kwargs) -> Dataset:
     """
     local_path = Path(path)
     if local_path.is_file():
-        builder = _EXTENSION_TO_BUILDER.get(local_path.suffix)
+        builder = _builder_for_local_file(local_path)
         if builder is None:
             raise ValueError(
                 f"Unsupported local dataset file extension '{local_path.suffix}' for '{path}'. "
-                f"Supported extensions: {sorted(_EXTENSION_TO_BUILDER)}"
+                f"Supported base extensions: {sorted(_EXTENSION_TO_BUILDER)} "
+                "(optionally compressed with .zst, .zstd, or .gz)."
             )
-        return load_dataset(builder, data_files=str(local_path), split=split, **load_kwargs)
+        # Name the local builder split after the configured source split.  A
+        # standalone validation file would otherwise be registered as
+        # ``train`` by datasets and ``split='validation'`` would fail.
+        return load_dataset(
+            builder,
+            data_files={split: str(local_path)},
+            split=split,
+            **load_kwargs,
+        )
+    if revision is not None and not local_path.exists():
+        load_kwargs["revision"] = revision
     return load_dataset(path, split=split, **load_kwargs)
+
+
+def _is_null_feature(feature: object) -> bool:
+    return isinstance(feature, Value) and feature.dtype == "null"
+
+
+def _merge_list_struct_fields(
+    column: str,
+    features: list[List],
+) -> dict:
+    """Build a nullable union for a list-of-struct column across datasets."""
+    merged: dict = {}
+    for feature in features:
+        if not isinstance(feature.feature, dict):
+            raise ValueError(f"Column '{column}' is not consistently a list of message records.")
+        for name, field_feature in feature.feature.items():
+            if name not in merged or _is_null_feature(merged[name]):
+                merged[name] = field_feature
+                continue
+            if _is_null_feature(field_feature) or merged[name] == field_feature:
+                continue
+            raise ValueError(
+                f"Cannot align nested field '{column}.{name}': conflicting feature types "
+                f"{merged[name]!r} and {field_feature!r}. Normalize this field upstream."
+            )
+    return merged
+
+
+def _align_nested_list_structs(datasets: list[Dataset], num_proc: int) -> list[Dataset]:
+    """Align optional fields inside ``messages``/preference conversation lists.
+
+    ``concatenate_datasets`` already fills missing top-level columns with null,
+    but it cannot align nested records such as ``messages[{role, content}]``
+    with function-calling messages that additionally carry ``functions`` and
+    ``function_calls``. Add the missing nested keys as nullable fields before
+    concatenation while preserving every field present in any input.
+    """
+    if len(datasets) < 2:
+        return datasets
+
+    columns = sorted(set().union(*(ds.column_names for ds in datasets)))
+    unions: dict[str, dict] = {}
+    for column in columns:
+        list_features = [
+            ds.features[column]
+            for ds in datasets
+            if column in ds.features
+            and isinstance(ds.features[column], List)
+            and isinstance(ds.features[column].feature, dict)
+        ]
+        if len(list_features) < 2:
+            continue
+        merged = _merge_list_struct_fields(column, list_features)
+        if any(feature.feature != merged for feature in list_features):
+            unions[column] = merged
+
+    if not unions:
+        return datasets
+
+    aligned: list[Dataset] = []
+    for ds in datasets:
+        applicable = {column: fields for column, fields in unions.items() if column in ds.features}
+        if not applicable:
+            aligned.append(ds)
+            continue
+
+        target_features = Features(dict(ds.features))
+        for column, fields in applicable.items():
+            target_features[column] = List(fields)
+
+        def normalize_nested(row: dict) -> dict:
+            updates = {}
+            for column, fields in applicable.items():
+                values = row.get(column)
+                if values is None:
+                    updates[column] = None
+                    continue
+                updates[column] = [{name: item.get(name) for name in fields} for item in values]
+            return updates
+
+        aligned.append(
+            ds.map(
+                normalize_nested,
+                features=target_features,
+                num_proc=num_proc,
+                desc="aligning nested conversation schemas",
+            )
+        )
+    return aligned
 
 
 def _resolve_num_proc(configured: int | None) -> int:
@@ -152,11 +272,13 @@ def load_and_mix_datasets(
 
     loaded_datasets: list[Dataset] = []
     for entry in entries:
+        resolved_path = entry.resolve_path(config.location)
         logger.info(
-            "Loading dataset '%s' from '%s' (data_dir=%s, subset=%s, split=%s, "
-            "weight=%s, transform=%s)",
+            "Loading dataset '%s' from '%s' (revision=%s, data_dir=%s, subset=%s, "
+            "split=%s, weight=%s, transform=%s)",
             entry.name,
-            entry.path,
+            resolved_path,
+            entry.revision,
             entry.data_dir,
             entry.subset,
             entry.split,
@@ -171,7 +293,18 @@ def load_and_mix_datasets(
         if entry.subset is not None:
             load_kwargs["name"] = entry.subset
 
-        ds = _load_dataset_entry(entry.path, entry.split, **load_kwargs)
+        ds = _load_dataset_entry(
+            resolved_path,
+            entry.split,
+            revision=entry.revision,
+            **load_kwargs,
+        )
+
+        if entry.expected_rows is not None and len(ds) != entry.expected_rows:
+            raise ValueError(
+                f"Dataset '{entry.name}' has {len(ds)} rows at the selected source, "
+                f"expected {entry.expected_rows}. Check its revision, subset, and split."
+            )
 
         # Apply optional per-dataset transform.
         if entry.transform is not None:
@@ -215,6 +348,8 @@ def load_and_mix_datasets(
             logger.info("Dataset '%s' has %d rows after filtering.", entry.name, len(ds))
 
         loaded_datasets.append(ds)
+
+    loaded_datasets = _align_nested_list_structs(loaded_datasets, num_proc)
 
     resampled_datasets: list[Dataset] = []
     for idx, (ds, weight) in enumerate(zip(loaded_datasets, weights, strict=True)):

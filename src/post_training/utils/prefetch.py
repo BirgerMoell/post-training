@@ -109,18 +109,28 @@ def _prefetch_tokenizer(name_or_path: str, revision: str | None = None) -> str:
     return local_path
 
 
-def _prefetch_dataset(entry: DatasetEntry) -> None:
-    if _is_local(entry.path):
+def _prefetch_dataset(entry: DatasetEntry, location: str | None = None) -> list[str]:
+    path = entry.resolve_path(location)
+    if _is_local(path):
         logger.info("Dataset '%s' is a local path, skipping download.", entry.name)
-        return
-    logger.info("Downloading dataset '%s' ('%s') to HF cache...", entry.name, entry.path)
+        return []
+    logger.info(
+        "Downloading dataset '%s' ('%s', revision=%s) to HF cache...",
+        entry.name,
+        path,
+        entry.revision or "main",
+    )
     load_kwargs: dict = {}
     if entry.data_dir is not None:
         load_kwargs["data_dir"] = entry.data_dir
     if entry.subset is not None:
         load_kwargs["name"] = entry.subset
-    load_dataset(entry.path, split=entry.split, **load_kwargs)
+    if entry.revision is not None:
+        load_kwargs["revision"] = entry.revision
+    dataset = load_dataset(path, split=entry.split, **load_kwargs)
+    cache_files = [item["filename"] for item in dataset.cache_files if item.get("filename")]
     logger.info("Dataset '%s' cached.", entry.name)
+    return cache_files
 
 
 def prefetch_assets(config: PostTrainingConfig) -> PrefetchedPaths:
@@ -148,8 +158,8 @@ def prefetch_assets(config: PostTrainingConfig) -> PrefetchedPaths:
     if config.method == "dpo" and config.dpo.ref_model_name_or_path is not None:
         ref_model_path = _prefetch_model(config.dpo.ref_model_name_or_path)
 
-    for entry in config.data.datasets:
-        _prefetch_dataset(entry)
+    for entry in [*config.data.datasets, *config.data.eval_datasets]:
+        entry.prefetched_files = _prefetch_dataset(entry, config.data.location)
 
     logger.info("All assets pre-fetched successfully.")
     return PrefetchedPaths(model=model_path, tokenizer=tokenizer_path, ref_model=ref_model_path)
